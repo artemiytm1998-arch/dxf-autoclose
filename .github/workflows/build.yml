@@ -1,0 +1,30 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install ezdxf pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --onefile --windowed --name DxfAutoClose dxf_autoclose.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DxfAutoClose-exe
+          path: dist/DxfAutoClose.exe
