@@ -21,7 +21,7 @@ jobs:
         run: pip install ezdxf pyinstaller
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --name DxfContourFixer dxf_contour_fixer.py
+        run: pyinstaller --onefile --windowed --icon=icon.ico --name DxfContourFixer dxf_contour_fixer.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
