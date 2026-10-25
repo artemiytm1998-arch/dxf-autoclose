@@ -10,21 +10,21 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install deps
         run: pip install ezdxf pyinstaller
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --name DxfAutoClose dxf_autoclose.py
+        run: pyinstaller --onefile --windowed --name DxfContourFixer dxf_contour_fixer.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DxfAutoClose-exe
-          path: dist/DxfAutoClose.exe
+          name: DxfContourFixer-exe
+          path: dist/DxfContourFixer.exe
