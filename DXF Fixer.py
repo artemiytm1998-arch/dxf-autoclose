@@ -771,4 +771,283 @@ class DxfApp:
         vars = {}
         for key, txt, default in [
             ('zero_length', 'Нулевой длины (< допуска)', True),
-            ('isolated', 'Изолированные (
+            ('isolated', 'Изолированные (без соседей с обоих концов)', True),
+            ('open_chains', 'Разомкнутые цепочки (не образуют замкнутый контур)', False),
+        ]:
+            v = tk.BooleanVar(value=default)
+            vars[key] = v
+            tk.Checkbutton(dlg, text=txt, variable=v).pack(anchor='w', padx=20)
+
+        tk.Label(dlg, text="Мин. длина сегмента (мм, 0 = не фильтровать):",
+                 anchor='w').pack(fill='x', padx=10, pady=(10, 2))
+        min_len_var = tk.StringVar(value="0")
+        tk.Entry(dlg, textvariable=min_len_var, width=15).pack(anchor='w', padx=20)
+
+        def run():
+            try:
+                min_mm = float(min_len_var.get() or "0")
+            except ValueError:
+                messagebox.showerror("Ошибка", "Мин. длина — число"); return
+            tol = self.get_tol_doc()
+            if tol is None: return
+            opts = {k: v.get() for k, v in vars.items()}
+            opts['min_length'] = min_mm / self.unit_to_mm if self.unit_to_mm > 0 else min_mm
+            self.push_undo()
+            self.log(f"Очистка: {opts}")
+            n = clean_doc(self.doc, tol, opts, self.log)
+            self.log(f"Удалено объектов: {n}")
+            self.selection.clear()
+            self.contours = None
+            self.break_points = []
+            self._rebuild_cache()
+            self.fit_view()
+            dlg.destroy()
+            self.status(f"Очистка: удалено {n}")
+
+        tk.Button(dlg, text="Очистить", command=run, height=2,
+                  bg='#e8ffe8').pack(fill='x', padx=20, pady=10)
+        tk.Button(dlg, text="Отмена", command=dlg.destroy).pack()
+
+    # ---------- hit test + snap ----------
+    def hit_test(self, wx, wy):
+        if self.scale <= 0: return None
+        thr = 6 / self.scale
+        best_d = thr; best = None
+        for it in self.entity_cache:
+            bx0, by0, bx1, by1 = it['bbox']
+            if wx < bx0-thr or wx > bx1+thr: continue
+            if wy < by0-thr or wy > by1+thr: continue
+            pl = it['polyline']
+            for i in range(len(pl)-1):
+                d, _ = point_to_seg((wx, wy), (pl[i].x, pl[i].y), (pl[i+1].x, pl[i+1].y))
+                if d < best_d: best_d = d; best = it
+        return best
+
+    def find_snap(self, wx, wy, radius_px=12):
+        if not self.entity_cache or self.scale <= 0:
+            return (wx, wy, 'free')
+        r = radius_px / self.scale
+        best_d = r; best_pt = None
+        for it in self.entity_cache:
+            for pt in (it['polyline'][0], it['polyline'][-1]):
+                d = hypot(pt.x-wx, pt.y-wy)
+                if d < best_d: best_d = d; best_pt = (pt.x, pt.y)
+        if best_pt: return (best_pt[0], best_pt[1], 'endpoint')
+        for it in self.entity_cache:
+            bx0, by0, bx1, by1 = it['bbox']
+            if wx < bx0-r or wx > bx1+r or wy < by0-r or wy > by1+r: continue
+            pl = it['polyline']
+            for i in range(len(pl)-1):
+                d, cp = point_to_seg((wx, wy), (pl[i].x, pl[i].y), (pl[i+1].x, pl[i+1].y))
+                if d < best_d: best_d = d; best_pt = cp
+        if best_pt: return (best_pt[0], best_pt[1], 'line')
+        return (wx, wy, 'free')
+
+    def entity_entity_distance(self, pl1, pl2):
+        best = (float('inf'), None, None)
+        for i in range(len(pl1)-1):
+            a1 = (pl1[i].x, pl1[i].y); a2 = (pl1[i+1].x, pl1[i+1].y)
+            for j in range(len(pl2)-1):
+                b1 = (pl2[j].x, pl2[j].y); b2 = (pl2[j+1].x, pl2[j+1].y)
+                d, pa, pb = seg_seg_dist_pts(a1, a2, b1, b2)
+                if d < best[0]:
+                    best = (d, pa, pb)
+                    if d < 1e-9: return best
+        return best
+
+    # ---------- mouse ----------
+    def _on_lpress(self, ev):
+        if not self.doc: return
+        wx, wy = self.s2w(ev.x, ev.y)
+        mode = self.mode_var.get()
+
+        if mode == 'select':
+            hit = self.hit_test(wx, wy)
+            shift = bool(ev.state & 0x0001)
+            if hit:
+                if shift:
+                    if hit['handle'] in self.selection: self.selection.discard(hit['handle'])
+                    else: self.selection.add(hit['handle'])
+                else:
+                    self.selection = {hit['handle']}
+                self.redraw()
+            else:
+                if not shift: self.selection.clear()
+                self._box_start = (ev.x, ev.y); self._box_end = (ev.x, ev.y)
+                self.redraw()
+
+        elif mode == 'measure_pp':
+            sx, sy, typ = self.find_snap(wx, wy)
+            if self.measure_p1 is None:
+                self.measure_p1 = (sx, sy)
+                self.status(f"P1: X={sx*self.unit_to_mm:.3f} Y={sy*self.unit_to_mm:.3f} мм. Кликните P2.")
+            else:
+                p1 = self.measure_p1; p2 = (sx, sy)
+                d = hypot(p2[0]-p1[0], p2[1]-p1[1])
+                dx = p2[0]-p1[0]; dy = p2[1]-p1[1]
+                self.measure_result = (p1, p2, d, dx, dy)
+                self.measure_p1 = None
+                self.status(f"Расстояние: {d*self.unit_to_mm:.3f} мм")
+            self.redraw()
+
+        elif mode == 'measure_ll':
+            hit = self.hit_test(wx, wy)
+            if not hit:
+                self.status("Кликните по линии"); return
+            if self.measure_e1 is None:
+                self.measure_e1 = hit['handle']
+                self.status("Линия 1 выбрана. Кликните линию 2.")
+            else:
+                if self.measure_e1 == hit['handle']:
+                    self.status("Это та же линия. Выберите другую."); return
+                it1 = self._find_item(self.measure_e1)
+                it2 = hit
+                if it1 and it2:
+                    d, pa, pb = self.entity_entity_distance(it1['polyline'], it2['polyline'])
+                    self.measure_result = (pa, pb, d, pb[0]-pa[0], pb[1]-pa[1])
+                    self.status(f"Расстояние L-L: {d*self.unit_to_mm:.3f} мм")
+                self.measure_e1 = None
+            self.redraw()
+
+    def _on_ldrag(self, ev):
+        if self._box_start is not None:
+            self._box_end = (ev.x, ev.y); self.redraw()
+
+    def _on_lrelease(self, ev):
+        if self._box_start is None: return
+        x0, y0 = self._box_start
+        x1, y1 = self._box_end if self._box_end else (ev.x, ev.y)
+        self._box_start = None; self._box_end = None
+        if abs(x1-x0) < 3 and abs(y1-y0) < 3:
+            self.redraw(); return
+        wx0, wy0 = self.s2w(x0, y0)
+        wx1, wy1 = self.s2w(x1, y1)
+        wxmin, wxmax = min(wx0, wx1), max(wx0, wx1)
+        wymin, wymax = min(wy0, wy1), max(wy0, wy1)
+        for it in self.entity_cache:
+            bx0, by0, bx1, by1 = it['bbox']
+            if bx0 >= wxmin and bx1 <= wxmax and by0 >= wymin and by1 <= wymax:
+                self.selection.add(it['handle'])
+        self.redraw()
+
+    def _on_motion(self, ev):
+        if not self.doc: return
+        wx, wy = self.s2w(ev.x, ev.y)
+        self.coord_var.set(f"X={wx*self.unit_to_mm:.2f}  Y={wy*self.unit_to_mm:.2f} мм")
+        self.canvas.delete('hover')
+        if self.mode_var.get() == 'measure_pp':
+            sx, sy, typ = self.find_snap(wx, wy)
+            if typ != 'free':
+                px, py = self.w2s(sx, sy)
+                col = 'green' if typ == 'endpoint' else '#00aa00'
+                self.canvas.create_oval(px-6, py-6, px+6, py+6,
+                                         outline=col, width=2, tags='hover')
+                self.canvas.create_line(px-9, py, px+9, py, fill=col, tags='hover')
+                self.canvas.create_line(px, py-9, px, py+9, fill=col, tags='hover')
+
+    # ---------- pan ----------
+    def _pan_start(self, ev): self._pan = (ev.x, ev.y)
+    def _pan_move(self, ev):
+        if self._pan is None: return
+        dx = ev.x - self._pan[0]; dy = ev.y - self._pan[1]
+        self.ox -= dx / self.scale; self.oy += dy / self.scale
+        self._pan = (ev.x, ev.y); self.redraw()
+    def _pan_end(self, ev): self._pan = None
+
+    def _wheel(self, ev):
+        if not self.bbox: return
+        up = (getattr(ev, 'delta', 0) > 0) or (getattr(ev, 'num', 0) == 4)
+        dn = (getattr(ev, 'delta', 0) < 0) or (getattr(ev, 'num', 0) == 5)
+        if not up and not dn: return
+        f = 1.2 if up else 1/1.2
+        ch = self.canvas.winfo_height()
+        wx = ev.x/self.scale + self.ox
+        wy = (ch - ev.y)/self.scale + self.oy
+        self.scale *= f
+        self.ox = wx - ev.x/self.scale
+        self.oy = wy - (ch - ev.y)/self.scale
+        self.redraw()
+
+    # ---------- view ----------
+    def fit_view(self):
+        if not self.bbox: return
+        x0, y0, x1, y1 = self.bbox
+        w, h = max(x1-x0, 1e-6), max(y1-y0, 1e-6)
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw < 10 or ch < 10:
+            self.root.after(50, self.fit_view); return
+        m = 0.05
+        self.scale = min((cw*(1-2*m))/w, (ch*(1-2*m))/h)
+        self.ox = (x0+x1)/2 - cw/(2*self.scale)
+        self.oy = (y0+y1)/2 - ch/(2*self.scale)
+        self.redraw()
+
+    # ---------- redraw ----------
+    def redraw(self):
+        self.canvas.delete('all')
+        if self.contours:
+            for pts in self.contours:
+                sp = []
+                for p in pts:
+                    sx, sy = self.w2s(p.x, p.y); sp.extend([sx, sy])
+                if len(sp) >= 4:
+                    self.canvas.create_line(*sp, fill='#0033cc', width=1)
+        else:
+            for it in self.entity_cache:
+                sel = it['handle'] in self.selection
+                color = '#ff6600' if sel else 'black'
+                w = 2 if sel else 1
+                sp = []
+                for p in it['polyline']:
+                    sx, sy = self.w2s(p.x, p.y); sp.extend([sx, sy])
+                if len(sp) >= 4:
+                    self.canvas.create_line(*sp, fill=color, width=w)
+
+        # break points
+        for x, y in self.break_points:
+            sx, sy = self.w2s(x, y)
+            self.canvas.create_oval(sx-6, sy-6, sx+6, sy+6,
+                                     fill='red', outline='darkred', width=2)
+
+        # measure
+        if self.measure_p1:
+            sp = self.w2s(*self.measure_p1)
+            self.canvas.create_oval(sp[0]-6, sp[1]-6, sp[0]+6, sp[1]+6,
+                                     outline='#0033cc', width=2)
+        if self.measure_result:
+            p1, p2, d_doc, dx_doc, dy_doc = self.measure_result
+            s1 = self.w2s(p1[0], p1[1]); s2 = self.w2s(p2[0], p2[1])
+            self.canvas.create_line(s1[0], s1[1], s2[0], s2[1],
+                                     fill='#0033cc', width=2, dash=(6, 4))
+            mx = (s1[0]+s2[0])/2; my = (s1[1]+s2[1])/2
+            txt = f"{d_doc*self.unit_to_mm:.3f} мм"
+            self.canvas.create_text(mx, my-16, text=txt, fill='#0033cc',
+                                     font=('Arial', 10, 'bold'))
+            for s in (s1, s2):
+                self.canvas.create_oval(s[0]-5, s[1]-5, s[0]+5, s[1]+5,
+                                         fill='#0033cc', outline='#001166')
+
+        # update measurement status
+        if self.measure_result:
+            p1, p2, d_doc, dx_doc, dy_doc = self.measure_result
+            self.measure_var.set(
+                f"Расстояние: {d_doc*self.unit_to_mm:.3f} мм   "
+                f"(ΔX={dx_doc*self.unit_to_mm:.3f}  ΔY={dy_doc*self.unit_to_mm:.3f})"
+            )
+        elif self.measure_p1:
+            self.measure_var.set(
+                f"P1: X={self.measure_p1[0]*self.unit_to_mm:.3f} "
+                f"Y={self.measure_p1[1]*self.unit_to_mm:.3f} мм"
+            )
+
+        # box
+        if self._box_start and self._box_end:
+            x0, y0 = self._box_start; x1, y1 = self._box_end
+            self.canvas.create_rectangle(x0, y0, x1, y1,
+                                          outline='blue', dash=(3, 3), width=1)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    DxfApp(root)
+    root.mainloop()
